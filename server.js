@@ -928,7 +928,7 @@ app.post("/v1/chat/completions", async (req, reply) => {
     }
 
     // 逐块转发，只按住末尾的 [DONE] 帧，其余即时写出保持流式。
-    function process(text) {
+    function forwardChunk(text) {
       hold += text;
       const i = hold.indexOf("[DONE]");
       if (i >= 0) {
@@ -957,12 +957,12 @@ app.post("/v1/chat/completions", async (req, reply) => {
       if (done) break;
       const text = decoder.decode(value, { stream: true });
       if (doneSeen) flush(text);
-      else process(text);
+      else forwardChunk(text);
     }
     const tail = decoder.decode();
     if (tail) {
       if (doneSeen) flush(tail);
-      else process(tail);
+      else forwardChunk(tail);
     }
 
     // 批注 2026-09-08：DeepSeek V4 思考模式有时把答案写进 reasoning_content
