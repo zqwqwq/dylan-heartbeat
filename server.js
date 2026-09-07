@@ -231,6 +231,132 @@ function extractTimestamp(content) {
 }
 
 // ========================
+// 时间格式化 / 注入
+// ========================
+function formatTimeForModel(date) {
+  const pad = n => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+const WEEKDAY_CN = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"];
+
+function weekdayCN(date) {
+  return WEEKDAY_CN[date.getDay()] || "";
+}
+
+function weekdayForYmd(year, month, day) {
+  return weekdayCN(new Date(Number(year), Number(month) - 1, Number(day)));
+}
+
+// 返回 { time, weekday }，按 TIME_ZONE 计算，保证星期几和日期一致。
+function currentServerTime() {
+  const tz = String(process.env.TIME_ZONE || "").trim();
+  if (tz) {
+    try {
+      const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: tz,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false
+      }).formatToParts(new Date());
+      const get = t => {
+        const p = parts.find(x => x.type === t);
+        return p ? p.value : "";
+      };
+      let hour = get("hour");
+      if (hour === "24") hour = "00";
+      const y = get("year");
+      const m = get("month");
+      const d = get("day");
+      return {
+        time: `${y}-${m}-${d} ${hour}:${get("minute")}`,
+        weekday: weekdayForYmd(y, m, d)
+      };
+    } catch {}
+  }
+  const now = new Date();
+  return { time: formatTimeForModel(now), weekday: weekdayCN(now) };
+}
+
+// 去掉 Kelivo 消息模板注入的 {{date}} {{time}} 前缀，避免模型把时间当成用户说的话。
+function stripUserTimestampPrefix(msg) {
+  if (!msg || msg.role !== "user") return msg;
+  if (typeof msg.content !== "string") return msg;
+  const stripped = stripLeadingTimestamp(msg.content);
+  if (stripped === msg.content) return msg;
+  if (!stripped.trim()) return msg;
+  return { ...msg, content: stripped };
+}
+
+function injectSystemTimeNote(messages, timeStr, weekday) {
+  const wd = weekday && weekday.trim() ? `，${weekday.trim()}` : "";
+  const note = `当前时间：${timeStr}${wd}。这是系统注入的时间信息，不是用户说的话。`;
+  const idx = messages.findIndex(m => m.role === "system");
+  if (idx >= 0 && typeof messages[idx].content === "string") {
+    const sys = messages[idx];
+    messages[idx] = { ...sys, content: `${sys.content}\n\n${note}` };
+    return;
+  }
+  messages.unshift({ role: "system", content: note });
+}
+
+// ========================
+// DeepSeek V4 空正文兜底
+// ========================
+function extractResponseText(reasoning) {
+  if (typeof reasoning !== "string") return null;
+  const markers = ["response(", "response（", "response:", "response："];
+  let bestIdx = -1;
+  let bestMarker = null;
+  for (const m of markers) {
+    const idx = reasoning.lastIndexOf(m);
+    if (idx > bestIdx) {
+      bestIdx = idx;
+      bestMarker = m;
+    }
+  }
+  if (bestIdx < 0 || !bestMarker) return null;
+  let tail = reasoning.slice(bestIdx + bestMarker.length).trim();
+  if (!tail) return null;
+  if (bestMarker === "response(" || bestMarker === "response（") {
+    const close = bestMarker === "response(" ? ")" : "）";
+    if (tail.endsWith(close)) tail = tail.slice(0, -close.length).trim();
+  }
+  if (
+    (tail.startsWith('"') && tail.endsWith('"')) ||
+    (tail.startsWith("“") && tail.endsWith("”"))
+  ) {
+    tail = tail.slice(1, -1).trim();
+  }
+  return tail.length > 0 ? tail : null;
+}
+
+function patchNonStreamEmptyContent(responseText, contentType) {
+  if (!contentType.includes("application/json")) return responseText;
+  try {
+    const obj = JSON.parse(responseText);
+    const choices = obj.choices;
+    if (!Array.isArray(choices) || choices.length === 0) return responseText;
+    const c0 = choices[0];
+    const message = c0 && c0.message;
+    if (!message || typeof message !== "object") return responseText;
+    if (message.tool_calls && message.tool_calls.length) return responseText;
+    const content = typeof message.content === "string" ? message.content : "";
+    if (content.trim() !== "") return responseText;
+    const reasoning = message.reasoning_content ?? message.reasoning ?? "";
+    const extracted = extractResponseText(reasoning);
+    if (!extracted) return responseText;
+    message.content = extracted;
+    return JSON.stringify(obj);
+  } catch {
+    return responseText;
+  }
+}
+
+// ========================
 // 时间戳记忆库
 // ========================
 function loadTimestampDB() {
@@ -565,9 +691,32 @@ app.post("/v1/chat/completions", async (req, reply) => {
 
     // Kelivo 发图时 content 常是数组。默认原样透传给视觉模型；
     // 如上游不支持图片，可设置 MULTIMODAL_MODE=text 退回文本占位。
+    // 同时把用户消息里 Kelivo 注入的 {{date}} {{time}} 前缀剥掉，
+    // 避免模型把时间当成用户说的话。
     const llmMessages = kelivoMessages
       .map(prepareMessageForLLM)
       .filter(Boolean);
+
+    // 批注 2026-09-08：剥掉的时间不再作为用户发言转发，改为把最新一条时间
+    // 作为系统级“当前时间”注入，让模型知道时间而不当成用户发言。
+    // 注意：必须在剥前缀之前读取时间，剥完后消息里就没有时间可提取了。
+    const timestamped = kelivoMessages
+      .map(msg => ({ ts: extractTimestamp(normalizeContentToText(msg.content)) }))
+      .filter(x => x.ts)
+      .sort((a, b) => b.ts - a.ts);
+    for (let i = 0; i < llmMessages.length; i++) {
+      llmMessages[i] = stripUserTimestampPrefix(llmMessages[i]);
+    }
+    if (timestamped.length > 0) {
+      injectSystemTimeNote(
+        llmMessages,
+        formatTimeForModel(timestamped[0].ts),
+        weekdayCN(timestamped[0].ts)
+      );
+    } else if (kelivoMessages.some(m => m.role === "user")) {
+      const now = currentServerTime();
+      injectSystemTimeNote(llmMessages, now.time, now.weekday);
+    }
 
     const oldEvents = stripPosition(
       oldTimeline.filter(isSpecialEvent).sort((a, b) => {
@@ -689,7 +838,10 @@ app.post("/v1/chat/completions", async (req, reply) => {
 
     // 批注 2026-07-11：Kelivo 关闭 stream 时需要收到普通 JSON；只在请求或上游确认为 SSE 时才按流式直通。
     if (!shouldStreamResponse) {
-      const responseText = await response.text();
+      let responseText = await response.text();
+      // 批注 2026-09-08：DeepSeek V4 思考模式有时把答案写进 reasoning_content
+      // 的 response(...) 里、正文 content 为空。这里兜底提取，避免空白回复。
+      responseText = patchNonStreamEmptyContent(responseText, upstreamContentType || "");
       return reply
         .code(response.status)
         .header("Content-Type", upstreamContentType || "application/json")
@@ -707,11 +859,137 @@ app.post("/v1/chat/completions", async (req, reply) => {
     });
 
     const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let sawContent = false;
+    let sawToolCalls = false;
+    let finishReason = "";
+    let reasoningAccum = "";
+    let lastChunkObj = null;
+    let hold = "";
+    let doneSeen = false;
+
+    function flush(s) {
+      if (s) reply.raw.write(Buffer.from(s, "utf8"));
+    }
+
+    // 只观察、不拦截：统计正文 / 工具调用 / 思考内容 / 结束原因。
+    function inspect(s) {
+      let work = s;
+      while (true) {
+        const nl = work.indexOf("\n");
+        const line = nl < 0 ? work : work.slice(0, nl);
+        const rest = nl < 0 ? "" : work.slice(nl + 1);
+        const t = line.trim();
+        if (t.startsWith("data:")) {
+          const payload = t.slice(5).trim();
+          if (payload && payload !== "[DONE]") {
+            try {
+              const obj = JSON.parse(payload);
+              if (obj && typeof obj === "object") {
+                lastChunkObj = obj;
+                const choices = obj.choices;
+                if (
+                  Array.isArray(choices) && choices.length > 0 &&
+                  choices[0] && typeof choices[0] === "object"
+                ) {
+                  const c0 = choices[0];
+                  if (c0.finish_reason) finishReason = String(c0.finish_reason);
+                  const delta = c0.delta;
+                  if (delta && typeof delta === "object") {
+                    if (typeof delta.content === "string" && delta.content.length > 0) {
+                      sawContent = true;
+                    }
+                    const rc = delta.reasoning_content ?? delta.reasoning;
+                    if (typeof rc === "string") reasoningAccum += rc;
+                    if (delta.tool_calls) sawToolCalls = true;
+                  }
+                  const msg = c0.message;
+                  if (msg && typeof msg === "object") {
+                    if (typeof msg.content === "string" && msg.content.length > 0) {
+                      sawContent = true;
+                    }
+                    if (msg.tool_calls) sawToolCalls = true;
+                  }
+                }
+              }
+            } catch {}
+          }
+        }
+        if (nl < 0) break;
+        work = rest;
+      }
+    }
+
+    function longestDonePrefix(s) {
+      for (let len = "[DONE]".length - 1; len >= 1; len--) {
+        if (s.endsWith("[DONE]".slice(0, len))) return len;
+      }
+      return 0;
+    }
+
+    // 逐块转发，只按住末尾的 [DONE] 帧，其余即时写出保持流式。
+    function process(text) {
+      hold += text;
+      const i = hold.indexOf("[DONE]");
+      if (i >= 0) {
+        const before = hold.slice(0, i);
+        flush(before);
+        inspect(before);
+        hold = hold.slice(i + "[DONE]".length);
+        doneSeen = true;
+        return;
+      }
+      const keep = longestDonePrefix(hold);
+      if (keep > 0) {
+        const safe = hold.slice(0, hold.length - keep);
+        flush(safe);
+        inspect(safe);
+        hold = hold.slice(hold.length - keep);
+      } else {
+        flush(hold);
+        inspect(hold);
+        hold = "";
+      }
+    }
+
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      reply.raw.write(value);
+      const text = decoder.decode(value, { stream: true });
+      if (doneSeen) flush(text);
+      else process(text);
     }
+    const tail = decoder.decode();
+    if (tail) {
+      if (doneSeen) flush(tail);
+      else process(tail);
+    }
+
+    // 批注 2026-09-08：DeepSeek V4 思考模式有时把答案写进 reasoning_content
+    // 的 response(...) 里、正文 content 为空。这里兜底提取，在 [DONE] 前注入正文。
+    const needsFallback = !sawContent && !sawToolCalls && finishReason !== "tool_calls";
+    let recovered = null;
+    if (needsFallback) {
+      recovered = extractResponseText(reasoningAccum);
+      if (!recovered && lastChunkObj && Array.isArray(lastChunkObj.choices) && lastChunkObj.choices[0]) {
+        const m = lastChunkObj.choices[0].message;
+        if (m && !m.content && !m.tool_calls) {
+          recovered = extractResponseText(m.reasoning_content ?? m.reasoning);
+        }
+      }
+    }
+    if (recovered) {
+      flush(`data: ${JSON.stringify({
+        id: "chatcmpl-heartbeat-fallback",
+        object: "chat.completion.chunk",
+        model: body?.model || "",
+        choices: [{ index: 0, delta: { content: recovered }, finish_reason: null }]
+      })}\n\n`);
+    }
+    if (doneSeen) {
+      flush("data: [DONE]\n\n");
+    }
+    flush(hold);
     reply.raw.end();
   } catch (err) {
     console.error(err);
